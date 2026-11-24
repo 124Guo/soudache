@@ -1,0 +1,315 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>像素搜打撤</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; overflow: hidden; touch-action: none; font-family: monospace; }
+  canvas { display: block; image-rendering: pixelated; }
+  #ui { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; justify-content: space-between; color: #fff; font-size: 18px; font-weight: bold; pointer-events: none; text-shadow: 2px 2px 0 #000; }
+  #overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; color: #fff; z-index: 10; }
+  #overlay.hide { display: none; }
+  h1 { color: #fbbf24; margin-bottom: 15px; font-size: 28px; text-shadow: 3px 3px 0 #b45309; }
+  p { color: #a1a1aa; margin-bottom: 30px; text-align: center; line-height: 1.6; padding: 0 20px; font-size: 14px; }
+  button { padding: 15px 40px; font-size: 18px; background: #22c55e; color: #000; border: none; font-weight: bold; cursor: pointer; box-shadow: 0 4px 0 #166534; font-family: monospace; }
+  button:active { transform: translateY(4px); box-shadow: none; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div>🩸 <span id="hp">100</span></div>
+  <div>💰 <span id="loot">0</span></div>
+  <div>💀 <span id="kills">0</span></div>
+</div>
+
+<div id="overlay">
+  <h1>像素搜打撤</h1>
+  <p>左侧滑动移动，右侧滑动自动瞄准射击。<br>捡起黄色物资，击杀红色敌人。<br>最后进入 <span style="color:#22c55e">绿色区域</span> 成功撤离！</p>
+  <button onclick="startGame()">进入战区</button>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+window.addEventListener('resize', resize); resize();
+
+// 游戏状态
+let player, enemies, bullets, loots, extractZone, particles;
+let isPlaying = false, killCount = 0, lootCount = 0, reqAnimation;
+let camera = { x: 0, y: 0 };
+let touchMove = { id: null, startX: 0, startY: 0, curX: 0, curY: 0 };
+let touchShoot = { id: null, startX: 0, startY: 0, curX: 0, curY: 0 };
+
+const MAP_SIZE = 2000;
+
+function init() {
+  player = { x: MAP_SIZE/2, y: MAP_SIZE/2, r: 15, speed: 4, hp: 100, maxHp: 100, fireRate: 10, cooldown: 0 };
+  enemies = []; bullets = []; loots = []; particles = [];
+  killCount = 0; lootCount = 0;
+  document.getElementById('hp').innerText = player.hp;
+  document.getElementById('loot').innerText = 0;
+  document.getElementById('kills').innerText = 0;
+
+  // 生成50个敌人
+  for(let i=0; i<50; i++) spawnEnemy();
+  // 生成30个物资
+  for(let i=0; i<30; i++) {
+    loots.push({ x: Math.random()*MAP_SIZE, y: Math.random()*MAP_SIZE, r: 8, type: 'loot' });
+  }
+  // 撤离点 (在地图右上角)
+  extractZone = { x: MAP_SIZE - 200, y: 200, r: 80, active: lootCount >= 0 };
+  
+  camera.x = player.x - W/2;
+  camera.y = player.y - H/2;
+}
+
+function spawnEnemy() {
+  let x, y, dist;
+  do {
+    x = Math.random() * MAP_SIZE;
+    y = Math.random() * MAP_SIZE;
+    dist = Math.hypot(x - MAP_SIZE/2, y - MAP_SIZE/2);
+  } while (dist < 400); // 不在出生点附近生成
+  enemies.push({ x, y, r: 15, hp: 20, speed: 1.5, color: '#ef4444' });
+}
+
+// 触摸控制
+window.addEventListener('touchstart', e => {
+  if(!isPlaying) return;
+  e.preventDefault();
+  for(let i=0; i<e.touches.length; i++) {
+    let t = e.touches[i];
+    if(t.clientX < W/2 && touchMove.id === null) {
+      touchMove.id = t.identifier; touchMove.startX = t.clientX; touchMove.startY = t.clientY; touchMove.curX = t.clientX; touchMove.curY = t.clientY;
+    } else if(t.clientX >= W/2 && touchShoot.id === null) {
+      touchShoot.id = t.identifier; touchShoot.startX = t.clientX; touchShoot.startY = t.clientY; touchShoot.curX = t.clientX; touchShoot.curY = t.clientY;
+    }
+  }
+}, {passive: false});
+
+window.addEventListener('touchmove', e => {
+  if(!isPlaying) return;
+  e.preventDefault();
+  for(let i=0; i<e.touches.length; i++) {
+    let t = e.touches[i];
+    if(t.identifier === touchMove.id) { touchMove.curX = t.clientX; touchMove.curY = t.clientY; }
+    if(t.identifier === touchShoot.id) { touchShoot.curX = t.clientX; touchShoot.curY = t.clientY; }
+  }
+}, {passive: false});
+
+window.addEventListener('touchend', e => {
+  for(let i=0; i<e.changedTouches.length; i++) {
+    let t = e.changedTouches[i];
+    if(t.identifier === touchMove.id) touchMove.id = null;
+    if(t.identifier === touchShoot.id) touchShoot.id = null;
+  }
+});
+
+function update() {
+  if(!isPlaying) return;
+  
+  // 1. 玩家移动
+  let dx = 0, dy = 0;
+  if(touchMove.id !== null) {
+    let mx = touchMove.curX - touchMove.startX;
+    let my = touchMove.curY - touchMove.startY;
+    let dist = Math.hypot(mx, my);
+    if(dist > 10) {
+      dx = (mx / dist) * player.speed;
+      dy = (my / dist) * player.speed;
+      player.x += dx; player.y += dy;
+    }
+  }
+
+  // 2. 玩家射击
+  if(touchShoot.id !== null && player.cooldown <= 0) {
+    let sx = touchShoot.curX - touchShoot.startX;
+    let sy = touchShoot.curY - touchShoot.startY;
+    let dist = Math.hypot(sx, sy);
+    if(dist > 10) {
+      let angle = Math.atan2(sy, sx);
+      bullets.push({ x: player.x, y: player.y, vx: Math.cos(angle)*10, vy: Math.sin(angle)*10, r: 4, life: 60 });
+      player.cooldown = player.fireRate;
+    }
+  }
+  if(player.cooldown > 0) player.cooldown--;
+
+  // 3. 摄像机跟随
+  camera.x += (player.x - W/2 - camera.x) * 0.1;
+  camera.y += (player.y - H/2 - camera.y) * 0.1;
+
+  // 4. 子弹逻辑
+  for(let i=bullets.length-1; i>=0; i--) {
+    let b = bullets[i];
+    b.x += b.vx; b.y += b.vy; b.life--;
+    if(b.life <= 0) { bullets.splice(i, 1); continue; }
+    
+    // 子弹打敌人
+    for(let j=enemies.length-1; j>=0; j--) {
+      let e = enemies[j];
+      if(Math.hypot(b.x - e.x, b.y - e.y) < e.r) {
+        e.hp -= 10;
+        bullets.splice(i, 1);
+        createParticles(e.x, e.y, '#ef4444');
+        if(e.hp <= 0) {
+          enemies.splice(j, 1);
+          killCount++;
+          document.getElementById('kills').innerText = killCount;
+          spawnEnemy(); // 死了再刷一个
+        }
+        break;
+      }
+    }
+  }
+
+  // 5. 敌人逻辑
+  for(let e of enemies) {
+    let dist = Math.hypot(player.x - e.x, player.y - e.y);
+    if(dist < 400) { // 索敌范围
+      e.x += ((player.x - e.x) / dist) * e.speed;
+      e.y += ((player.y - e.y) / dist) * e.speed;
+      if(dist < player.r + e.r) {
+        player.hp -= 0.5; // 持续掉血
+        if(player.hp <= 0) gameOver("你阵亡了");
+      }
+    }
+  }
+  document.getElementById('hp').innerText = Math.ceil(player.hp);
+
+  // 6. 捡物资
+  for(let i=loots.length-1; i>=0; i--) {
+    let l = loots[i];
+    if(Math.hypot(player.x - l.x, player.y - l.y) < player.r + 10) {
+      loots.splice(i, 1);
+      lootCount++;
+      document.getElementById('loot').innerText = lootCount;
+      createParticles(l.x, l.y, '#fbbf24');
+    }
+  }
+
+  // 7. 撤离点逻辑
+  if(Math.hypot(player.x - extractZone.x, player.y - extractZone.y) < extractZone.r) {
+    gameOver("撤离成功！", true);
+  }
+
+  // 粒子更新
+  for(let i=particles.length-1; i>=0; i--) {
+    let p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.life--;
+    if(p.life <= 0) particles.splice(i, 1);
+  }
+
+  render();
+  reqAnimation = requestAnimationFrame(update);
+}
+
+function createParticles(x, y, color) {
+  for(let i=0; i<8; i++) {
+    let angle = Math.random() * Math.PI * 2;
+    particles.push({ x, y, vx: Math.cos(angle)*Math.random()*5, vy: Math.sin(angle)*Math.random()*5, life: 20, color: color });
+  }
+}
+
+function render() {
+  ctx.fillStyle = '#18181b'; // 像素风暗色底
+  ctx.fillRect(0, 0, W, H);
+  
+  ctx.save();
+  ctx.translate(-camera.x, -camera.y); // 摄像机位移
+
+  // 画网格背景 (营造像素感)
+  ctx.strokeStyle = '#27272a'; ctx.lineWidth = 2;
+  for(let i=0; i<MAP_SIZE; i+=100) {
+    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, MAP_SIZE); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(MAP_SIZE, i); ctx.stroke();
+  }
+
+  // 画撤离点
+  ctx.fillStyle = 'rgba(34, 197, 94, 0.2)';
+  ctx.beginPath(); ctx.arc(extractZone.x, extractZone.y, extractZone.r, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = '#22c55e'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'center';
+  ctx.fillText("撤离点", extractZone.x, extractZone.y + 10);
+
+  // 画物资
+  for(let l of loots) {
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillRect(l.x - 8, l.y - 8, 16, 16);
+  }
+
+  // 画敌人
+  for(let e of enemies) {
+    ctx.fillStyle = e.color;
+    ctx.fillRect(e.x - e.r, e.y - e.r, e.r*2, e.r*2);
+  }
+
+  // 画子弹
+  for(let b of bullets) {
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillRect(b.x - 3, b.y - 3, 6, 6);
+  }
+
+  // 画粒子
+  for(let p of particles) {
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+  }
+
+  // 画玩家
+  ctx.fillStyle = '#6ea8fe';
+  ctx.fillRect(player.x - player.r, player.y - player.r, player.r*2, player.r*2);
+  // 画玩家枪口方向
+  if(touchShoot.id !== null) {
+    let sx = touchShoot.curX - touchShoot.startX;
+    let sy = touchShoot.curY - touchShoot.startY;
+    if(Math.hypot(sx, sy) > 10) {
+      let angle = Math.atan2(sy, sx);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(player.x, player.y);
+      ctx.lineTo(player.x + Math.cos(angle)*25, player.y + Math.sin(angle)*25); ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+
+  // 画虚拟摇杆
+  if(touchMove.id !== null) {
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath(); ctx.arc(touchMove.startX, touchMove.startY, 40, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath(); ctx.arc(touchMove.curX, touchMove.curY, 20, 0, Math.PI*2); ctx.fill();
+  }
+  if(touchShoot.id !== null) {
+    ctx.fillStyle = 'rgba(239,68,68,0.2)';
+    ctx.beginPath(); ctx.arc(touchShoot.startX, touchShoot.startY, 40, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(239,68,68,0.5)';
+    ctx.beginPath(); ctx.arc(touchShoot.curX, touchShoot.curY, 20, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+function startGame() {
+  document.getElementById('overlay').classList.add('hide');
+  init();
+  isPlaying = true;
+  update();
+}
+
+function gameOver(reason, isWin = false) {
+  isPlaying = false;
+  cancelAnimationFrame(reqAnimation);
+  const overlay = document.getElementById('overlay');
+  overlay.classList.remove('hide');
+  overlay.innerHTML = `
+    <h1 style="color:${isWin ? '#22c55e' : '#ef4444'}">${isWin ? '撤离成功' : '任务失败'}</h1>
+    <p>${reason}<br>带出物资: ${lootCount} | 击杀: ${killCount}</p>
+    <button onclick="location.reload()">再来一局</button>
+  `;
+}
+</script>
+</body>
+</html>
